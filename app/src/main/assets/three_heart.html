@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body, html { width: 100%; height: 100%; overflow: hidden; background: #090D16; }
+  #canvas-container { width: 100%; height: 100%; position: relative; }
+  #hud-overlay {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    color: #94A3B8;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 11px;
+    pointer-events: none;
+    background: rgba(17, 24, 39, 0.75);
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px solid #283655;
+    z-index: 10;
+  }
+  #hud-overlay span { color: #00E5FF; font-weight: bold; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+<div id="canvas-container">
+  <div id="hud-overlay">WebGL Three.js • <span id="vessel-status">LAD Normal</span></div>
+</div>
+
+<script>
+let scene, camera, renderer, controls;
+let heartMesh, aortaMesh, pulmonaryMesh;
+let ladMesh, lcxMesh, rcaMesh, ladDiagMesh, lcxMargMesh, rcaMargMesh;
+let raycaster, mouse;
+let bpm = 75;
+let animationTime = 0;
+let highlightedVessel = 'LAD';
+
+const colors = {
+  lad: 0xFF1744,
+  lcx: 0x00E676,
+  rca: 0x00E676,
+  myo: 0x1E2A45,
+  myoEmissive: 0x0B1220,
+  aorta: 0xD32F2F,
+  pulmonary: 0x1976D2
+};
+
+function init() {
+  const container = document.getElementById('canvas-container');
+  const width = container.clientWidth || window.innerWidth;
+  const height = container.clientHeight || window.innerHeight;
+
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x090D16);
+  scene.fog = new THREE.FogExp2(0x090D16, 0.0035);
+
+  camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
+  camera.position.set(0, 5, 52);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setSize(width, height);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  container.appendChild(renderer.domElement);
+
+  if (typeof THREE.OrbitControls !== 'undefined') {
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.maxDistance = 85;
+    controls.minDistance = 20;
+    controls.autoRotate = false;
+  }
+
+  // Lighting
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.55);
+  scene.add(ambientLight);
+
+  const mainLight = new THREE.DirectionalLight(0xffffff, 1.2);
+  mainLight.position.set(20, 40, 30);
+  scene.add(mainLight);
+
+  const rimLight = new THREE.DirectionalLight(0x00E5FF, 0.85);
+  rimLight.position.set(-30, -20, -20);
+  scene.add(rimLight);
+
+  const arterialGlowLight = new THREE.PointLight(0xFF3B5C, 1.5, 40);
+  arterialGlowLight.position.set(0, 0, 15);
+  scene.add(arterialGlowLight);
+
+  buildHeartGeometry();
+
+  raycaster = new THREE.Raycaster();
+  mouse = new THREE.Vector2();
+
+  window.addEventListener('resize', onWindowResize);
+  renderer.domElement.addEventListener('pointerdown', onPointerDown);
+
+  animate();
+}
+
+function buildHeartGeometry() {
+  const heartGroup = new THREE.Group();
+  heartGroup.name = "HEART_ROOT";
+
+  // 1. Myocardium (Ventricular body hull)
+  const myoGeom = new THREE.SphereGeometry(14, 32, 28);
+  const pos = myoGeom.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    let x = pos.getX(i);
+    let y = pos.getY(i);
+    let z = pos.getZ(i);
+
+    // Cardiac deformation: tapered apex at -y, anterior bulge
+    if (y < 0) {
+      const taper = 1.0 + (y / 14) * 0.75;
+      x *= Math.max(taper, 0.15);
+      z *= Math.max(taper, 0.15);
+      y *= 1.35;
+    }
+    // Asymmetric Left Ventricle bulge
+    if (x < 0) x *= 1.25;
+    if (z > 0) z *= 1.15;
+
+    pos.setXYZ(i, x, y, z);
+  }
+  myoGeom.computeVertexNormals();
+
+  const myoMat = new THREE.MeshStandardMaterial({
+    color: colors.myo,
+    emissive: colors.myoEmissive,
+    roughness: 0.45,
+    metalness: 0.25,
+    wireframe: false
+  });
+  heartMesh = new THREE.Mesh(myoGeom, myoMat);
+  heartGroup.add(heartMesh);
+
+  // Wireframe accent overlay for anatomical depth
+  const wireMat = new THREE.MeshBasicMaterial({
+    color: 0x2A3E66,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.22
+  });
+  const wireMesh = new THREE.Mesh(myoGeom, wireMat);
+  heartGroup.add(wireMesh);
+
+  // 2. Ascending Aorta & Arch
+  const aortaCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0, 10, 2),
+    new THREE.Vector3(1, 16, 0),
+    new THREE.Vector3(-2, 21, -4),
+    new THREE.Vector3(-7, 21, -8),
+    new THREE.Vector3(-10, 16, -11)
+  ]);
+  const aortaGeom = new THREE.TubeGeometry(aortaCurve, 24, 3.2, 16, false);
+  const aortaMat = new THREE.MeshStandardMaterial({
+    color: colors.aorta,
+    roughness: 0.3,
+    metalness: 0.2,
+    emissive: 0x330005
+  });
+  aortaMesh = new THREE.Mesh(aortaGeom, aortaMat);
+  heartGroup.add(aortaMesh);
+
+  // 3. Pulmonary Trunk
+  const pulmonaryCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(-3, 9, 5),
+    new THREE.Vector3(-5, 15, 3),
+    new THREE.Vector3(-8, 18, -1)
+  ]);
+  const pulmonaryGeom = new THREE.TubeGeometry(pulmonaryCurve, 18, 2.8, 14, false);
+  const pulmonaryMat = new THREE.MeshStandardMaterial({
+    color: colors.pulmonary,
+    roughness: 0.35,
+    metalness: 0.2
+  });
+  pulmonaryMesh = new THREE.Mesh(pulmonaryGeom, pulmonaryMat);
+  heartGroup.add(pulmonaryMesh);
+
+  // 4. THE THREE TARGET CORONARY VESSELS:
+
+  // LAD (Left Anterior Descending)
+  const ladCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(-3, 10, 8),   // Ostium / LMCA bifurcation
+    new THREE.Vector3(-3.5, 4, 13), // Proximal LAD
+    new THREE.Vector3(-2.8, -2, 15),// Mid LAD
+    new THREE.Vector3(-1.8, -8, 14),// Distal LAD
+    new THREE.Vector3(0, -14, 10),  // Apical wrap
+    new THREE.Vector3(1, -18, 3)    // Apex
+  ]);
+  const ladGeom = new THREE.TubeGeometry(ladCurve, 32, 1.25, 12, false);
+  const ladMat = new THREE.MeshStandardMaterial({
+    color: colors.lad,
+    emissive: colors.lad,
+    emissiveIntensity: 0.45,
+    roughness: 0.2
+  });
+  ladMesh = new THREE.Mesh(ladGeom, ladMat);
+  ladMesh.name = "LAD";
+  heartGroup.add(ladMesh);
+
+  // LAD Diagonal branch (D1)
+  const ladDiagCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(-2.8, -2, 15),
+    new THREE.Vector3(-7, -4, 13),
+    new THREE.Vector3(-10, -8, 10)
+  ]);
+  const ladDiagGeom = new THREE.TubeGeometry(ladDiagCurve, 16, 0.75, 10, false);
+  ladDiagMesh = new THREE.Mesh(ladDiagGeom, ladMat);
+  ladDiagMesh.name = "LAD_D1";
+  heartGroup.add(ladDiagMesh);
+
+  // LCX (Left Circumflex Artery)
+  const lcxCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(-3, 10, 8),
+    new THREE.Vector3(-8, 9, 6),
+    new THREE.Vector3(-13, 6, 2),
+    new THREE.Vector3(-15, 1, -4),
+    new THREE.Vector3(-14, -6, -9),
+    new THREE.Vector3(-10, -12, -11)
+  ]);
+  const lcxGeom = new THREE.TubeGeometry(lcxCurve, 28, 1.15, 12, false);
+  const lcxMat = new THREE.MeshStandardMaterial({
+    color: colors.lcx,
+    emissive: colors.lcx,
+    emissiveIntensity: 0.35,
+    roughness: 0.2
+  });
+  lcxMesh = new THREE.Mesh(lcxGeom, lcxMat);
+  lcxMesh.name = "LCX";
+  heartGroup.add(lcxMesh);
+
+  // LCX Obtuse Marginal branch (OM1)
+  const lcxMargCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(-13, 6, 2),
+    new THREE.Vector3(-15, 0, 5),
+    new THREE.Vector3(-13, -7, 8)
+  ]);
+  const lcxMargGeom = new THREE.TubeGeometry(lcxMargCurve, 16, 0.7, 10, false);
+  lcxMargMesh = new THREE.Mesh(lcxMargGeom, lcxMat);
+  lcxMargMesh.name = "LCX_OM1";
+  heartGroup.add(lcxMargMesh);
+
+  // RCA (Right Coronary Artery)
+  const rcaCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(4, 9, 7),
+    new THREE.Vector3(9, 7, 7),
+    new THREE.Vector3(13, 1, 5),
+    new THREE.Vector3(13, -6, 1),
+    new THREE.Vector3(10, -11, -4),
+    new THREE.Vector3(5, -15, -7),
+    new THREE.Vector3(2, -18, -4)
+  ]);
+  const rcaGeom = new THREE.TubeGeometry(rcaCurve, 30, 1.2, 12, false);
+  const rcaMat = new THREE.MeshStandardMaterial({
+    color: colors.rca,
+    emissive: colors.rca,
+    emissiveIntensity: 0.35,
+    roughness: 0.2
+  });
+  rcaMesh = new THREE.Mesh(rcaGeom, rcaMat);
+  rcaMesh.name = "RCA";
+  heartGroup.add(rcaMesh);
+
+  // RCA Acute Marginal branch
+  const rcaMargCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(13, 1, 5),
+    new THREE.Vector3(14, -4, 8),
+    new THREE.Vector3(11, -9, 9)
+  ]);
+  const rcaMargGeom = new THREE.TubeGeometry(rcaMargCurve, 16, 0.7, 10, false);
+  rcaMargMesh = new THREE.Mesh(rcaMargGeom, rcaMat);
+  rcaMargMesh.name = "RCA_AM";
+  heartGroup.add(rcaMargMesh);
+
+  scene.add(heartGroup);
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  animationTime += 0.016;
+  const cycleSeconds = 60.0 / Math.max(bpm, 40);
+  const phase = (animationTime % cycleSeconds) / cycleSeconds;
+
+  // Systolic contraction pulse
+  const contraction = Math.sin(phase * Math.PI * 2);
+  const scale = 1.0 + contraction * 0.045;
+
+  const heart = scene.getObjectByName("HEART_ROOT");
+  if (heart) {
+    heart.scale.set(scale, scale, scale);
+  }
+
+  // Pulsating emissive effect for stenosed vessels
+  if (ladMesh && colors.lad === 0xFF1744) {
+    ladMesh.material.emissiveIntensity = 0.5 + Math.sin(animationTime * 8) * 0.3;
+  }
+  if (lcxMesh && colors.lcx === 0xFF1744) {
+    lcxMesh.material.emissiveIntensity = 0.5 + Math.sin(animationTime * 8) * 0.3;
+  }
+  if (rcaMesh && colors.rca === 0xFF1744) {
+    rcaMesh.material.emissiveIntensity = 0.5 + Math.sin(animationTime * 8) * 0.3;
+  }
+
+  if (controls) controls.update();
+  renderer.render(scene, camera);
+}
+
+function onPointerDown(event) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+  const targets = [ladMesh, lcxMesh, rcaMesh].filter(Boolean);
+  const intersects = raycaster.intersectObjects(targets, true);
+
+  if (intersects.length > 0) {
+    const clicked = intersects[0].object.name;
+    const baseVessel = clicked.startsWith('LAD') ? 'LAD' : clicked.startsWith('LCX') ? 'LCX' : 'RCA';
+    setHighlightedVessel(baseVessel);
+
+    // Call Android interface
+    if (window.AndroidBridge && window.AndroidBridge.onVesselSelected) {
+      window.AndroidBridge.onVesselSelected(baseVessel);
+    }
+  }
+}
+
+function setHighlightedVessel(vessel) {
+  highlightedVessel = vessel;
+  const hud = document.getElementById('vessel-status');
+  if (hud) hud.textContent = vessel + " Focused";
+}
+
+function onWindowResize() {
+  const container = document.getElementById('canvas-container');
+  const width = container.clientWidth || window.innerWidth;
+  const height = container.clientHeight || window.innerHeight;
+  camera.aspect = width / height;
+  camera.updateProjectionMatrix();
+  renderer.setSize(width, height);
+}
+
+// Global function callable from Android Kotlin via evaluateJavascript
+window.updateHeartState = function(ladHex, lcxHex, rcaHex, newBpm, focusVessel, isRwmaActive) {
+  if (newBpm) bpm = parseInt(newBpm);
+
+  if (ladMesh && ladHex) {
+    const c = parseInt(ladHex.replace('#', '0x'));
+    ladMesh.material.color.setHex(c);
+    ladMesh.material.emissive.setHex(c);
+    if (ladDiagMesh) {
+      ladDiagMesh.material.color.setHex(c);
+      ladDiagMesh.material.emissive.setHex(c);
+    }
+    colors.lad = c;
+  }
+
+  if (lcxMesh && lcxHex) {
+    const c = parseInt(lcxHex.replace('#', '0x'));
+    lcxMesh.material.color.setHex(c);
+    lcxMesh.material.emissive.setHex(c);
+    if (lcxMargMesh) {
+      lcxMargMesh.material.color.setHex(c);
+      lcxMargMesh.material.emissive.setHex(c);
+    }
+    colors.lcx = c;
+  }
+
+  if (rcaMesh && rcaHex) {
+    const c = parseInt(rcaHex.replace('#', '0x'));
+    rcaMesh.material.color.setHex(c);
+    rcaMesh.material.emissive.setHex(c);
+    if (rcaMargMesh) {
+      rcaMargMesh.material.color.setHex(c);
+      rcaMargMesh.material.emissive.setHex(c);
+    }
+    colors.rca = c;
+  }
+
+  if (heartMesh && isRwmaActive) {
+    heartMesh.material.emissive.setHex(0x3B101E); // Ischemic hypokinesis myocardial tint
+  } else if (heartMesh) {
+    heartMesh.material.emissive.setHex(0x0B1220);
+  }
+
+  if (focusVessel) {
+    setHighlightedVessel(focusVessel);
+  }
+};
+
+window.onload = init;
+</script>
+</body>
+</html>

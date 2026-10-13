@@ -1,0 +1,6 @@
+{
+  "name": "CardioVision 3D",
+  "description": "Interactive 3D cardiovascular risk visualization & CAD prediction with vessel stenosis mapping (LAD, LCX, RCA), real-time physiological inputs, and multimodal Gemini AI intelligence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
